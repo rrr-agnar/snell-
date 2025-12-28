@@ -6,212 +6,137 @@ INFO_FILE="/root/proxy-info.txt"
 SING_DIR="/etc/sing-box"
 XRAY_DIR="/usr/local/etc/xray"
 SSL_DIR="/etc/ssl"
-IP=$(curl -s ipinfo.io/ip)
+IP=$(curl -s https://api64.ipify.org || curl -s ipinfo.io/ip)
 
-# ================= 通用函数 =================
-pause(){ read -rp "按回车继续..."; }
+# 颜色定义
+green='\033[0;32m'
+plain='\033[0m'
 
-ask_yes_no(){
-  read -rp "$1 (y/N): " yn
-  [[ "$yn" =~ ^[Yy]$ ]]
-}
-
-port_used(){ ss -lnt | awk '{print $4}' | grep -q ":$1$"; }
+# ================= 通用工具函数 =================
+pause(){ read -rp "按回车继续..." p; }
 
 ask_port(){
-  while true; do
-    read -rp "端口(留空自动): " p
-    if [ -z "$p" ]; then
-      while true; do
-        p=$(shuf -i 20000-60000 -n 1)
-        port_used "$p" || break
-      done
-      echo "$p"; return
-    fi
-    port_used "$p" && echo "端口占用" || { echo "$p"; return; }
-  done
+  read -rp "请输入端口 (回车随机): " p
+  if [ -z "$p" ]; then
+    p=$(shuf -i 20000-60000 -n 1)
+  fi
+  echo "$p"
 }
 
 ask_uuid(){
-  read -rp "UUID(留空自动): " u
+  read -rp "请输入UUID (回车自动): " u
   [ -z "$u" ] && u=$(cat /proc/sys/kernel/random/uuid)
   echo "$u"
 }
 
-ask_pass(){
-  read -rp "密码(留空自动): " p
-  [ -z "$p" ] && p=$(openssl rand -hex 8)
-  echo "$p"
-}
-
-gen_reality_key(){
-  private=$(openssl rand -base64 32)
-  public=$(echo -n "$private" | sha256sum | awk '{print $1}')
-  echo "$private|$public"
-}
-
+# ================= 核心安装逻辑 =================
 install_base(){
-  apt update -y
-  apt install -y curl wget unzip tar socat nano openssl cron
+  apt update -y && apt install -y curl wget unzip tar openssl
 }
 
-# ================= 证书 =================
-install_cert(){
-  read -rp "输入域名: " domain
-  read -rp "输入邮箱: " email
-
-  mkdir -p $SSL_DIR
-  curl https://get.acme.sh | sh
-  ~/.acme.sh/acme.sh --register-account -m $email
-  ~/.acme.sh/acme.sh --issue --standalone -d $domain
-  ~/.acme.sh/acme.sh --install-cert -d $domain \
-    --key-file $SSL_DIR/key.pem \
-    --fullchain-file $SSL_DIR/cert.pem
-
-  echo "证书已生成：$SSL_DIR"
+# 自动化生成 sing-box Reality 配置 (核心补充)
+gen_singbox_reality_conf(){
+  local port=$1; local uuid=$2; local priv=$3; local pub=$4; local sni=$5
+  cat > $SING_DIR/config.json <<EOF
+{
+  "inbounds": [{
+    "type": "vless",
+    "tag": "vless-in",
+    "listen": "::",
+    "listen_port": $port,
+    "users": [{"uuid": "$uuid"}],
+    "tls": {
+      "enabled": true,
+      "server_name": "$sni",
+      "reality": {
+        "enabled": true,
+        "handshake": { "server": "$sni", "server_port": 443 },
+        "private_key": "$priv",
+        "short_id": ["$(openssl rand -hex 4)"]
+      }
+    }
+  }],
+  "outbounds": [{"type": "direct"}]
 }
-
-# ================= 内核安装 =================
-install_singbox(){
-  install_base
-  ver=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d'"' -f4)
-  wget -q https://github.com/SagerNet/sing-box/releases/download/${ver}/sing-box-${ver#v}-linux-amd64.tar.gz
-  tar -xzf sing-box-*.tar.gz
-  mv sing-box-*/sing-box /usr/local/bin/
-  chmod +x /usr/local/bin/sing-box
-  mkdir -p $SING_DIR
-
-cat >/etc/systemd/system/sing-box.service <<EOF
-[Service]
-ExecStart=/usr/local/bin/sing-box run -c $SING_DIR/config.json
-Restart=always
-LimitNOFILE=51200
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  systemctl enable sing-box
-  echo "sing-box" > $CORE_FILE
-}
-
-install_xray(){
-  install_base
-  bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
-  systemctl enable xray
-  echo "xray" > $CORE_FILE
-}
-
-# ================= 协议 =================
-
-install_vless(){
-  port=$(ask_port); uuid=$(ask_uuid)
-cat >$INFO_FILE <<EOF
-VLESS
-vless://$uuid@$IP:$port?encryption=none
 EOF
 }
 
-install_vmess(){
-  port=$(ask_port); uuid=$(ask_uuid)
-cat >$INFO_FILE <<EOF
-VMess
-vmess://$uuid@$IP:$port
-EOF
-}
+# ================= 协议部署 =================
+deploy_reality(){
+  echo -e "${green}正在配置 Reality (推荐)...${plain}"
+  local port=$(ask_port)
+  local uuid=$(ask_uuid)
+  read -rp "目标域名 (回车默认 www.microsoft.com): " sni
+  [ -z "$sni" ] && sni="www.microsoft.com"
+  
+  # 生成密钥对
+  local keys=$(sing-box generate reality-keypair)
+  local priv=$(echo "$keys" | awk '/Private key:/ {print $3}')
+  local pub=$(echo "$keys" | awk '/Public key:/ {print $3}')
 
-install_trojan(){
-  port=$(ask_port); pass=$(ask_pass)
-cat >$INFO_FILE <<EOF
-Trojan
-trojan://$pass@$IP:$port
-EOF
-}
-
-install_ss(){
-  port=$(ask_port); pass=$(ask_pass)
-cat >$INFO_FILE <<EOF
-Shadowsocks
-ss://aes-128-gcm:$pass@$IP:$port
-EOF
-}
-
-install_reality(){
-  port=$(ask_port); uuid=$(ask_uuid)
-read -rp "SNI(默认 www.cloudflare.com): " sni
-[ -z "$sni" ] && sni="www.cloudflare.com"
-keypair=$(gen_reality_key)
-private=${keypair%%|*}
-public=${keypair##*|}
-cat >$INFO_FILE <<EOF
-Reality
-vless://$uuid@$IP:$port?security=reality&sni=$sni&pbk=$public
-EOF
-}
-
-install_hysteria2(){
-  port=$(ask_port); pass=$(ask_pass)
-cat >$INFO_FILE <<EOF
-Hysteria2
-hy2://$pass@$IP:$port
-EOF
-}
-
-install_tuic(){
-  port=$(ask_port); pass=$(ask_pass)
-cat >$INFO_FILE <<EOF
-TUIC
-tuic://$pass@$IP:$port
-EOF
-}
-
-# ================= 菜单 =================
-choose_core(){
-  echo "1 sing-box"
-  echo "2 xray"
-  read -rp "选择: " c
-  [ "$c" = "1" ] && install_singbox
-  [ "$c" = "2" ] && install_xray
-}
-
-choose_proto(){
   CORE=$(cat $CORE_FILE)
-  echo "1 VLESS"
-  echo "2 Reality"
-  echo "3 Trojan"
-  echo "4 Shadowsocks"
-  [ "$CORE" = "xray" ] && echo "5 VMess"
-  [ "$CORE" = "sing-box" ] && echo "6 Hysteria2"
-  [ "$CORE" = "sing-box" ] && echo "7 TUIC"
-  read -rp "选择: " p
-  case $p in
-    1) install_vless ;;
-    2) install_reality ;;
-    3) install_trojan ;;
-    4) install_ss ;;
-    5) install_vmess ;;
-    6) install_hysteria2 ;;
-    7) install_tuic ;;
-  esac
+  if [ "$CORE" = "sing-box" ]; then
+    gen_singbox_reality_conf "$port" "$uuid" "$priv" "$pub" "$sni"
+  else
+    # 这里可以添加 Xray 的 Reality 配置写入逻辑
+    echo "Xray Reality 配置写入待补充..."
+  fi
+
+  cat >$INFO_FILE <<EOF
+协议: Reality (VLESS)
+地址: $IP
+端口: $port
+UUID: $uuid
+SNI: $sni
+PublicKey: $pub
+链接: vless://$uuid@$IP:$port?security=reality&sni=$sni&pbk=$pub&fp=chrome&type=grpc#Reality_Node
+EOF
 }
 
-# ================= 主面板 =================
-while true; do
-clear
-echo "========= 内置代理面板 ========="
-echo "1 安装协议"
-echo "2 查看节点信息"
-echo "3 申请/更新证书"
-echo "4 启动服务"
-echo "5 卸载"
-echo "0 退出"
-read -rp "选择: " n
+# ================= 主菜单 =================
+show_menu(){
+  clear
+  echo "====================================="
+  echo "      Sing-box/Xray 远程一键面板"
+  echo "====================================="
+  echo "1. 安装 Sing-box 内核"
+  echo "2. 安装 Xray 内核"
+  echo "3. 部署 Reality 节点 (回车即刻生成)"
+  echo "4. 查看当前节点信息"
+  echo "5. 启动/重启服务"
+  echo "0. 退出"
+  echo "====================================="
+}
 
-case $n in
-  1) choose_core; choose_proto; pause ;;
-  2) cat $INFO_FILE; pause ;;
-  3) install_cert; pause ;;
-  4) systemctl restart $(cat $CORE_FILE); pause ;;
-  5) systemctl stop sing-box xray; rm -rf $SING_DIR $XRAY_DIR $INFO_FILE; pause ;;
-  0) exit ;;
-esac
+while true; do
+  show_menu
+  read -rp "请选择: " opt
+  case $opt in
+    1)
+      install_base
+      # 简化的安装逻辑
+      bash <(curl -Ls https://raw.githubusercontent.com/SagerNet/sing-box/main/install.sh)
+      mkdir -p $SING_DIR
+      echo "sing-box" > $CORE_FILE
+      pause ;;
+    2)
+      install_base
+      bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
+      echo "xray" > $CORE_FILE
+      pause ;;
+    3)
+      if [ ! -f $CORE_FILE ]; then echo "请先安装内核！"; pause; continue; fi
+      deploy_reality
+      echo -e "${green}部署完成！信息已保存在 $INFO_FILE${plain}"
+      cat $INFO_FILE
+      pause ;;
+    4)
+      [ -f $INFO_FILE ] && cat $INFO_FILE || echo "暂无节点信息"
+      pause ;;
+    5)
+      CORE=$(cat $CORE_FILE)
+      systemctl restart $CORE && echo "$CORE 已启动"
+      pause ;;
+    0) exit 0 ;;
+  esac
 done
