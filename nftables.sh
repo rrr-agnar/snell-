@@ -34,7 +34,7 @@ EOF
     sysctl -p /etc/sysctl.d/99-relay.conf
 
     # 3. 写入基础框架到 /root/nftables.conf
-    # 修复了 MTU/MSS 兼容性问题
+    # 彻底移除报错的 rt mtureduce，改用通用 MSS 钳制
     cat <<EOF > $CONF_FILE
 #!/usr/sbin/nft -f
 flush ruleset
@@ -71,19 +71,19 @@ EOF
     # 5. 关联系统服务并强制加载
     ln -sf $CONF_FILE /etc/nftables.conf
     
-    # 先尝试停止并重新启动
+    # 清理并重启服务
     systemctl stop nftables 2>/dev/null
     if nft -f $CONF_FILE; then
         systemctl enable nftables --now
         echo -e "${GREEN}初始化成功！以后只需输入 'nr' 即可管理。${PLAIN}"
     else
-        echo -e "${RED}配置文件语法检测失败，请联系作者。${PLAIN}"
+        echo -e "${RED}配置文件语法检测失败，请手动检查 /root/nftables.conf${PLAIN}"
     fi
 }
 
 # 添加转发规则
 add_relay() {
-    # 自动确保表存在
+    # 自动确保内核结构存在
     nft add table ip nat 2>/dev/null
     nft add map ip nat relay_map { type inet_service : ipv4_addr . inet_service \; } 2>/dev/null
     nft add chain ip nat prerouting { type nat hook prerouting priority dstnat \; } 2>/dev/null
@@ -94,12 +94,12 @@ add_relay() {
     read -p "请输入落地机端口 (默认同中转): " rport
     [[ -z "$rport" ]] && rport=$lport
     
-    # 写入内核规则
+    # 写入内核
     nft add element ip nat relay_map { $lport : $rip . $rport }
     nft add rule inet filter input tcp dport $lport accept
     nft add rule inet filter input udp dport $lport accept
     
-    # 持久化到 root 配置文件
+    # 保存配置
     nft list ruleset > $CONF_FILE
     echo -e "${GREEN}添加成功: 本机 $lport -> $rip:$rport${PLAIN}"
 }
@@ -112,10 +112,10 @@ del_relay() {
     echo -e "${YELLOW}端口 $lport 的转发已删除并保存。${PLAIN}"
 }
 
-# 查看列表 (优化报错处理)
+# 查看列表
 list_relay() {
     echo -e "${BLUE}--- 当前 nftables 转发映射表 ---${PLAIN}"
-    # 提取 elements 块
+    # 修正：直接列出内存中的 elements，如果为空则友好提示
     res=$(nft list map ip nat relay_map 2>/dev/null | sed -n '/elements = {/,/}/p')
     if [[ -z "$res" || "$res" == *"elements = { }"* ]]; then
         echo -e "${YELLOW}目前没有任何转发规则${PLAIN}"
