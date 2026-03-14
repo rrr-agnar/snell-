@@ -2,166 +2,148 @@
 
 # 颜色定义
 RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
+GREEN='\033[0;36m'
+NC='\033[0m'
 BLUE='\033[0;34m'
-PLAIN='\033[0m'
+CYAN='\033[1;36m'
+WHITE='\033[1;37m'
 
-# 路径定义
-CONF_FILE="/root/nftables.conf"
-SCRIPT_PATH="/usr/local/bin/nr"
+RULES_FILE="/etc/nftables.conf"
+SYSCTL_CONF="/etc/sysctl.conf"
+SCRIPT_PATH=$(realpath "$0")
 
-# 检查root权限
-[[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 权限运行此脚本!${PLAIN}" && exit 1
+# 检查权限
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${RED}请使用 root 权限运行此脚本${NC}"
+    exit 1
+fi
 
-# 初始化系统环境
-init_nft() {
-    echo -e "${BLUE}开始安装 nftables 并优化内核转发...${PLAIN}"
+# 1. 初始化快捷启动与系统环境
+prepare_system() {
+    # 设置快捷命令 nf
+    if [ ! -f "/usr/local/bin/nf" ]; then
+        ln -sf "$SCRIPT_PATH" /usr/local/bin/nf
+        chmod +x /usr/local/bin/nf
+        echo -e "${GREEN}快捷启动已设置！以后只需输入 ${WHITE}nf${GREEN} 即可启动此脚本${NC}"
+    fi
+
+    # 开启 IP 转发
+    if ! grep -q "net.ipv4.ip_forward = 1" $SYSCTL_CONF; then
+        echo "net.ipv4.ip_forward = 1" >> $SYSCTL_CONF
+    fi
     
-    # 1. 安装软件包
-    if [[ -n $(command -v apt) ]]; then
+    # BBR 优化
+    if ! grep -q "net.core.default_qdisc = fq" $SYSCTL_CONF; then
+        echo "net.core.default_qdisc = fq" >> $SYSCTL_CONF
+        echo "net.ipv4.tcp_congestion_control = bbr" >> $SYSCTL_CONF
+    fi
+    sysctl -p > /dev/null 2>&1
+
+    # 安装 nftables
+    if ! command -v nft &> /dev/null; then
+        echo "正在安装 nftables..."
         apt update && apt install -y nftables
-    elif [[ -n $(command -v yum) ]]; then
-        yum install -y nftables
+    fi
+    systemctl enable nftables > /dev/null 2>&1
+    systemctl start nftables > /dev/null 2>&1
+}
+
+# 2. 添加转发规则
+add_forward_rule() {
+    echo -e "${WHITE}请输入转发规则信息：${NC}"
+    echo -e "${BLUE}----------------------------------------${NC}"
+    read -p "目标服务器 IP: " target_ip
+    read -p "本地端口: " local_port
+    read -p "目标端口: " target_port
+    echo -e "${BLUE}----------------------------------------${NC}"
+
+    if [[ -z "$target_ip" || -z "$local_port" || -z "$target_port" ]]; then
+        echo -e "${RED}输入不能为空！${NC}"
+        return
     fi
 
-    # 2. 开启内核转发与优化
-    cat <<EOF > /etc/sysctl.d/99-relay.conf
-net.ipv4.ip_forward = 1
-net.netfilter.nf_conntrack_max = 1048576
-net.ipv4.tcp_tw_reuse = 1
-EOF
-    sysctl -p /etc/sysctl.d/99-relay.conf
+    # 创建基础表结构
+    nft add table ip forward2jp
+    nft add chain ip forward2jp prerouting { type nat hook prerouting priority dstnat \; }
+    nft add chain ip forward2jp postrouting { type nat hook postrouting priority srcnat \; }
 
-    # 3. 写入基础框架到 /root/nftables.conf
-    # 彻底移除报错的 rt mtureduce，改用通用 MSS 钳制
-    cat <<EOF > $CONF_FILE
-#!/usr/sbin/nft -f
-flush ruleset
+    # 添加规则 (TCP + UDP)
+    nft add rule ip forward2jp prerouting tcp dport "${local_port}" dnat to "${target_ip}:${target_port}" comment "fwd_tcp_${local_port}"
+    nft add rule ip forward2jp prerouting udp dport "${local_port}" dnat to "${target_ip}:${target_port}" comment "fwd_udp_${local_port}"
+    
+    # 全局 masquerade (确保回程路由正确)
+    if ! nft list chain ip forward2jp postrouting | grep -q "masquerade"; then
+        nft add rule ip forward2jp postrouting masquerade
+    fi
 
-table ip nat {
-    map relay_map {
-        type inet_service : ipv4_addr . inet_service
-    }
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-        dnat ip addr . port to tcp dport map @relay_map
-        dnat ip addr . port to udp dport map @relay_map
-    }
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        masquerade
-    }
+    # 持久化
+    nft list ruleset > "$RULES_FILE"
+    echo -e "${GREEN}✅ 转发已开启: ${WHITE}${local_port} -> ${target_ip}:${target_port}${NC}"
 }
-table inet filter {
-    chain input {
-        type filter hook input priority filter; policy accept;
-        tcp dport 22 accept
-    }
-    chain forward {
-        type filter hook forward priority filter; policy accept;
-        tcp flags syn tcp option maxseg size set 1400
-    }
-}
-EOF
-    # 4. 设置快捷启动 nr
-    cp "$0" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
+
+# 3. 显示与删除规则
+manage_rules() {
+    clear
+    echo -e "${CYAN}当前转发规则列表：${NC}"
+    echo -e "${BLUE}----------------------------------------------------------------${NC}"
+    # 提取带有 comment 的规则并显示其 handle
+    local rules=$(nft -a list table ip forward2jp 2>/dev/null | grep 'comment "fwd_')
     
-    # 5. 关联系统服务并强制加载
-    ln -sf $CONF_FILE /etc/nftables.conf
+    if [ -z "$rules" ]; then
+        echo -e "  ${WHITE}暂无转发规则${NC}"
+        echo -e "${BLUE}----------------------------------------------------------------${NC}"
+        return
+    fi
+
+    echo "$rules" | awk '{
+        # 提取端口、目标和 handle
+        for(i=1;i<=NF;i++){
+            if($i=="dport") lp=$(i+1);
+            if($i=="to") tgt=$(i+1);
+            if($i=="handle") h=$(i+1);
+        }
+        printf "协议: %-4s | 本地端口: %-6s | 目标: %-20s | Handle: %s\n", $1, lp, tgt, h
+    }'
+    echo -e "${BLUE}----------------------------------------------------------------${NC}"
     
-    # 清理并重启服务
-    systemctl stop nftables 2>/dev/null
-    if nft -f $CONF_FILE; then
-        systemctl enable nftables --now
-        echo -e "${GREEN}初始化成功！以后只需输入 'nr' 即可管理。${PLAIN}"
+    read -p "请输入要删除的 Handle 编号 (直接回车取消): " handle_num
+    if [ -z "$handle_num" ]; then return; fi
+
+    if nft delete rule ip forward2jp prerouting handle "$handle_num" 2>/dev/null; then
+        nft list ruleset > "$RULES_FILE"
+        echo -e "${GREEN}✅ 规则 [Handle: $handle_num] 已成功删除${NC}"
     else
-        echo -e "${RED}配置文件语法检测失败，请手动检查 /root/nftables.conf${PLAIN}"
+        echo -e "${RED}❌ 删除失败，请检查 Handle 编号是否正确${NC}"
     fi
 }
 
-# 添加转发规则
-add_relay() {
-    # 自动确保内核结构存在
-    nft add table ip nat 2>/dev/null
-    nft add map ip nat relay_map { type inet_service : ipv4_addr . inet_service \; } 2>/dev/null
-    nft add chain ip nat prerouting { type nat hook prerouting priority dstnat \; } 2>/dev/null
-    nft add chain ip nat postrouting { type nat hook postrouting priority srcnat \; } 2>/dev/null
+# 主菜单
+main_menu() {
+    prepare_system
+    while true; do
+        clear
+        echo -e "${CYAN}┌────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│${WHITE}      NFTables 转发管理器 (nf)        ${CYAN}│${NC}"
+        echo -e "${CYAN}└────────────────────────────────────────┘${NC}"
+        echo -e " 1. ${WHITE}添加${NC} 转发规则 (TCP+UDP)"
+        echo -e " 2. ${WHITE}管理/删除${NC} 现有规则"
+        echo -e " 3. ${WHITE}查看${NC} 系统 BBR/转发状态"
+        echo -e " 0. ${WHITE}退出${NC}"
+        echo -e "${BLUE}----------------------------------------${NC}"
+        read -p "选择操作 [0-3]: " choice
 
-    read -p "请输入中转监听端口: " lport
-    read -p "请输入落地机 IP: " rip
-    read -p "请输入落地机端口 (默认同中转): " rport
-    [[ -z "$rport" ]] && rport=$lport
-    
-    # 写入内核
-    nft add element ip nat relay_map { $lport : $rip . $rport }
-    nft add rule inet filter input tcp dport $lport accept
-    nft add rule inet filter input udp dport $lport accept
-    
-    # 保存配置
-    nft list ruleset > $CONF_FILE
-    echo -e "${GREEN}添加成功: 本机 $lport -> $rip:$rport${PLAIN}"
+        case $choice in
+            1) add_forward_rule ;;
+            2) manage_rules ;;
+            3) 
+                echo -e "IP 转发状态: $(sysctl net.ipv4.ip_forward)"
+                echo -e "BBR 状态: $(sysctl net.ipv4.tcp_congestion_control)"
+                ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}无效选择${NC}" ;;
+        esac
+        read -p "按回车键继续..."
+    done
 }
 
-# 删除转发规则
-del_relay() {
-    read -p "请输入要删除的中转端口: " lport
-    nft delete element ip nat relay_map { $lport } 2>/dev/null
-    nft list ruleset > $CONF_FILE
-    echo -e "${YELLOW}端口 $lport 的转发已删除并保存。${PLAIN}"
-}
-
-# 查看列表
-list_relay() {
-    echo -e "${BLUE}--- 当前 nftables 转发映射表 ---${PLAIN}"
-    # 修正：直接列出内存中的 elements，如果为空则友好提示
-    res=$(nft list map ip nat relay_map 2>/dev/null | sed -n '/elements = {/,/}/p')
-    if [[ -z "$res" || "$res" == *"elements = { }"* ]]; then
-        echo -e "${YELLOW}目前没有任何转发规则${PLAIN}"
-    else
-        echo -e "$res"
-    fi
-    echo -e "${BLUE}-------------------------------${PLAIN}"
-}
-
-# 彻底卸载
-uninstall_nft() {
-    echo -e "${RED}警告: 此操作将删除所有规则并卸载快捷方式!${PLAIN}"
-    read -p "确认卸载? (y/n): " confirm
-    if [[ "$confirm" == "y" ]]; then
-        systemctl stop nftables
-        systemctl disable nftables
-        rm -f $CONF_FILE
-        rm -f /etc/nftables.conf
-        rm -f $SCRIPT_PATH
-        rm -f /etc/sysctl.d/99-relay.conf
-        echo -e "${YELLOW}所有配置已清理完毕。${PLAIN}"
-        exit 0
-    fi
-}
-
-# 菜单
-while true; do
-    echo -e "
-  ${GREEN}nftables 极速中转工具 [nr]${PLAIN}
-  ${BLUE}----------------------------${PLAIN}
-  ${GREEN}1.${PLAIN} 初始化环境 (首次运行)
-  ${GREEN}2.${PLAIN} 添加转发规则
-  ${GREEN}3.${PLAIN} 删除转发规则
-  ${GREEN}4.${PLAIN} 查看转发列表
-  ${YELLOW}5.${PLAIN} 彻底卸载 nftables
-  ${RED}0.${PLAIN} 退出
-  ${BLUE}----------------------------${PLAIN}
-  配置路径: ${YELLOW}$CONF_FILE${PLAIN}"
-    read -p "选择操作: " num
-    case "$num" in
-        1) init_nft ;;
-        2) add_relay ;;
-        3) del_relay ;;
-        4) list_relay ;;
-        5) uninstall_nft ;;
-        0) exit 0 ;;
-        *) echo "无效选择" ;;
-    esac
-done
+main_menu
