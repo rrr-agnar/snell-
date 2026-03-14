@@ -34,7 +34,6 @@ EOF
     sysctl -p /etc/sysctl.d/99-relay.conf
 
     # 3. 写入基础框架到 /root/nftables.conf
-    # 注意：这里增加了 elements = {} 以防止查询时报错
     cat <<EOF > $CONF_FILE
 #!/usr/sbin/nft -f
 flush ruleset
@@ -42,7 +41,6 @@ flush ruleset
 table ip nat {
     map relay_map {
         type inet_service : ipv4_addr . inet_service
-        elements = { }
     }
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
@@ -69,10 +67,13 @@ EOF
     cp "$0" "$SCRIPT_PATH"
     chmod +x "$SCRIPT_PATH"
     
-    # 5. 关联系统服务并立即启动
+    # 5. 关联系统服务并强制加载
     ln -sf $CONF_FILE /etc/nftables.conf
-    systemctl stop nftables 2>/dev/null
     systemctl enable nftables --now
+    
+    # 【核心修复：手动在内核中强制声明表和Map】
+    nft add table ip nat 2>/dev/null
+    nft add map ip nat relay_map { type inet_service : ipv4_addr . inet_service \; } 2>/dev/null
     nft -f $CONF_FILE
     
     echo -e "${GREEN}初始化成功！以后只需输入 'nr' 即可管理。${PLAIN}"
@@ -80,21 +81,24 @@ EOF
 
 # 添加转发规则
 add_relay() {
-    # 先检查表是否存在，不存在则引导初始化
-    if ! nft list table ip nat >/dev/null 2>&1; then
-        echo -e "${RED}错误：检测到环境未初始化，请先选 1${PLAIN}"
-        return
-    fi
+    # 如果内核中不存在表，先尝试创建，防止 add element 报错
+    nft add table ip nat 2>/dev/null
+    nft add map ip nat relay_map { type inet_service : ipv4_addr . inet_service \; } 2>/dev/null
+    nft add chain ip nat prerouting { type nat hook prerouting priority dstnat \; } 2>/dev/null
+    nft add chain ip nat postrouting { type nat hook postrouting priority srcnat \; } 2>/dev/null
 
     read -p "请输入中转监听端口: " lport
     read -p "请输入落地机 IP: " rip
     read -p "请输入落地机端口 (默认同中转): " rport
     [[ -z "$rport" ]] && rport=$lport
     
-    # 写入内核
+    # 写入内核规则
     nft add element ip nat relay_map { $lport : $rip . $rport }
     nft add rule inet filter input tcp dport $lport accept
     nft add rule inet filter input udp dport $lport accept
+    
+    # 写入转发逻辑（防止之前没加载成功）
+    nft add rule ip nat prerouting tcp dport map @relay_map dnat ip addr . port to tcp dport map @relay_map 2>/dev/null
     
     # 持久化到 root 配置文件
     nft list ruleset > $CONF_FILE
@@ -104,7 +108,7 @@ add_relay() {
 # 删除转发规则
 del_relay() {
     read -p "请输入要删除的中转端口: " lport
-    nft delete element ip nat relay_map { $lport }
+    nft delete element ip nat relay_map { $lport } 2>/dev/null
     nft list ruleset > $CONF_FILE
     echo -e "${YELLOW}端口 $lport 的转发已删除并保存。${PLAIN}"
 }
@@ -112,12 +116,12 @@ del_relay() {
 # 查看列表 (优化报错处理)
 list_relay() {
     echo -e "${BLUE}--- 当前 nftables 转发映射表 ---${PLAIN}"
-    # 如果 map 为空，nft 可能会报错，这里做个判断
-    res=$(nft list map ip nat relay_map 2>/dev/null)
+    # 直接列出 map 的 elements
+    res=$(nft list map ip nat relay_map 2>/dev/null | grep -A 100 "elements = {")
     if [[ -z "$res" ]]; then
         echo -e "${YELLOW}目前没有任何转发规则${PLAIN}"
     else
-        echo "$res"
+        echo -e "$res"
     fi
     echo -e "${BLUE}-------------------------------${PLAIN}"
 }
