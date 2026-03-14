@@ -34,6 +34,7 @@ EOF
     sysctl -p /etc/sysctl.d/99-relay.conf
 
     # 3. 写入基础框架到 /root/nftables.conf
+    # 修复了 MTU/MSS 兼容性问题
     cat <<EOF > $CONF_FILE
 #!/usr/sbin/nft -f
 flush ruleset
@@ -59,7 +60,7 @@ table inet filter {
     }
     chain forward {
         type filter hook forward priority filter; policy accept;
-        tcp flags syn tcp option maxseg size set rt mtureduce
+        tcp flags syn tcp option maxseg size set 1400
     }
 }
 EOF
@@ -69,19 +70,20 @@ EOF
     
     # 5. 关联系统服务并强制加载
     ln -sf $CONF_FILE /etc/nftables.conf
-    systemctl enable nftables --now
     
-    # 【核心修复：手动在内核中强制声明表和Map】
-    nft add table ip nat 2>/dev/null
-    nft add map ip nat relay_map { type inet_service : ipv4_addr . inet_service \; } 2>/dev/null
-    nft -f $CONF_FILE
-    
-    echo -e "${GREEN}初始化成功！以后只需输入 'nr' 即可管理。${PLAIN}"
+    # 先尝试停止并重新启动
+    systemctl stop nftables 2>/dev/null
+    if nft -f $CONF_FILE; then
+        systemctl enable nftables --now
+        echo -e "${GREEN}初始化成功！以后只需输入 'nr' 即可管理。${PLAIN}"
+    else
+        echo -e "${RED}配置文件语法检测失败，请联系作者。${PLAIN}"
+    fi
 }
 
 # 添加转发规则
 add_relay() {
-    # 如果内核中不存在表，先尝试创建，防止 add element 报错
+    # 自动确保表存在
     nft add table ip nat 2>/dev/null
     nft add map ip nat relay_map { type inet_service : ipv4_addr . inet_service \; } 2>/dev/null
     nft add chain ip nat prerouting { type nat hook prerouting priority dstnat \; } 2>/dev/null
@@ -96,9 +98,6 @@ add_relay() {
     nft add element ip nat relay_map { $lport : $rip . $rport }
     nft add rule inet filter input tcp dport $lport accept
     nft add rule inet filter input udp dport $lport accept
-    
-    # 写入转发逻辑（防止之前没加载成功）
-    nft add rule ip nat prerouting tcp dport map @relay_map dnat ip addr . port to tcp dport map @relay_map 2>/dev/null
     
     # 持久化到 root 配置文件
     nft list ruleset > $CONF_FILE
@@ -116,9 +115,9 @@ del_relay() {
 # 查看列表 (优化报错处理)
 list_relay() {
     echo -e "${BLUE}--- 当前 nftables 转发映射表 ---${PLAIN}"
-    # 直接列出 map 的 elements
-    res=$(nft list map ip nat relay_map 2>/dev/null | grep -A 100 "elements = {")
-    if [[ -z "$res" ]]; then
+    # 提取 elements 块
+    res=$(nft list map ip nat relay_map 2>/dev/null | sed -n '/elements = {/,/}/p')
+    if [[ -z "$res" || "$res" == *"elements = { }"* ]]; then
         echo -e "${YELLOW}目前没有任何转发规则${PLAIN}"
     else
         echo -e "$res"
