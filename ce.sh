@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # ==========================================
-# NFTABLES 转发管理工具（最终稳定版）
+# NFTABLES 转发管理工具（最终完整版）
 # 支持：
-# ✔ 来源IP可选
-# ✔ 多端口/范围
-# ✔ 精准删除
+# ✔ 单端口 / 端口范围
+# ✔ 可选来源IP（留空=不限制）
+# ✔ 多用户隔离
+# ✔ 精确删除规则
 # ✔ 一键清空
-# ✔ 一键彻底卸载
+# ✔ 一键卸载
 # ==========================================
 
 stty erase ^? 2>/dev/null
@@ -18,22 +19,21 @@ stty erase ^H 2>/dev/null
 CONF="/etc/nftables.conf"
 
 init_env() {
-    if ! command -v nft &>/dev/null; then
-        echo "安装 nftables..."
+    command -v nft >/dev/null 2>&1 || {
         apt update -y
-        DEBIAN_FRONTEND=noninteractive apt install -y nftables
-    fi
+        apt install -y nftables
+    }
 
     echo 1 > /proc/sys/net/ipv4/ip_forward
 
     systemctl enable nftables >/dev/null 2>&1
-    systemctl start nftables >/dev/null 2>&1
+    systemctl restart nftables
 
-    nft list table ip nat &>/dev/null || nft add table ip nat
-    nft list chain ip nat prerouting &>/dev/null || \
+    nft list table ip nat >/dev/null 2>&1 || nft add table ip nat
+    nft list chain ip nat prerouting >/dev/null 2>&1 || \
         nft add chain ip nat prerouting { type nat hook prerouting priority -100 \; }
 
-    nft list chain ip nat postrouting &>/dev/null || \
+    nft list chain ip nat postrouting >/dev/null 2>&1 || \
         nft add chain ip nat postrouting { type nat hook postrouting priority 100 \; }
 }
 
@@ -41,126 +41,112 @@ save_rules() {
     nft list ruleset > $CONF
 }
 
-# ================= 添加规则 =================
 add_rule() {
+    clear
     echo "--- 添加转发 ---"
 
-    read -p "来源IP（回车=不限制）: " SRC
-    read -p "本地端口 (如 80 或 1000-1100): " LPORT
-    read -p "目标IP: " RIP
-    read -p "目标端口(回车同端口): " RPORT
+    read -p "来源IP（留空=不限制）: " SRC
+    read -p "本地端口 (如 1000 或 1000-1010): " LPORT
+    read -p "目标IP: " DIP
+    read -p "目标端口(回车=相同): " DPORT
 
-    if [[ -z "$LPORT" || -z "$RIP" ]]; then
-        echo "❌ 输入不完整"
-        return
-    fi
+    [[ -z "$LPORT" || -z "$DIP" ]] && echo "输入不完整" && sleep 1 && return
 
-    if [[ -z "$RPORT" ]]; then
-        TARGET="$RIP"
-    else
-        TARGET="$RIP:$RPORT"
-    fi
+    [[ -z "$DPORT" ]] && TARGET="$DIP" || TARGET="$DIP:$DPORT"
 
     if [[ -z "$SRC" ]]; then
-        MATCH=""
-        echo "🌐 来源：不限制"
+        nft add rule ip nat prerouting tcp dport $LPORT counter dnat to $TARGET
+        nft add rule ip nat prerouting udp dport $LPORT counter dnat to $TARGET
     else
-        MATCH="ip saddr $SRC"
-        echo "🔒 来源限制：$SRC"
+        nft add rule ip nat prerouting ip saddr $SRC tcp dport $LPORT counter dnat to $TARGET
+        nft add rule ip nat prerouting ip saddr $SRC udp dport $LPORT counter dnat to $TARGET
     fi
 
-    nft add rule ip nat prerouting $MATCH tcp dport $LPORT counter dnat to $TARGET
-    nft add rule ip nat prerouting $MATCH udp dport $LPORT counter dnat to $TARGET
-    nft add rule ip nat postrouting ip daddr $RIP counter masquerade
+    nft add rule ip nat postrouting ip daddr $DIP counter masquerade 2>/dev/null
 
     save_rules
-
-    echo "✅ 转发成功：$LPORT → $TARGET"
+    echo "✅ 添加成功"
+    sleep 1
 }
 
-# ================= 查看/删除 =================
-list_del() {
-    while true; do
-        clear
-        echo "--- 当前转发规则 ---"
-
-        RULES=$(nft -a list chain ip nat prerouting | grep dnat)
-
-        if [[ -z "$RULES" ]]; then
-            echo "空空如也..."
-            read -p "回车返回..."
-            break
-        fi
-
-        echo "$RULES" | nl
-        echo "----------------------"
-        read -p "输入编号删除（回车返回）: " NUM
-
-        [[ -z "$NUM" ]] && break
-
-        HANDLE=$(echo "$RULES" | sed -n "${NUM}p" | awk '{print $NF}')
-
-        if [[ -n "$HANDLE" ]]; then
-            nft delete rule ip nat prerouting handle $HANDLE
-            save_rules
-            echo "✅ 已删除"
-        else
-            echo "❌ 无效编号"
-        fi
-
-        sleep 1
-    done
+list_rules() {
+    clear
+    echo "--- 当前转发规则 ---"
+    nft -a list chain ip nat prerouting | grep dnat
+    echo "----------------------"
 }
 
-# ================= 清空 =================
+delete_rule() {
+    mapfile -t HANDLES < <(nft -a list chain ip nat prerouting | grep dnat | awk '{print $NF}')
+
+    [[ ${#HANDLES[@]} -eq 0 ]] && echo "无规则" && sleep 1 && return
+
+    echo "--- 当前规则 ---"
+    nft -a list chain ip nat prerouting | grep dnat | nl -w2 -s'. '
+
+    echo "----------------------"
+    read -p "输入编号删除（回车返回）: " NUM
+
+    [[ -z "$NUM" ]] && return
+
+    IDX=$((NUM-1))
+
+    [[ -z "${HANDLES[$IDX]}" ]] && echo "无效编号" && sleep 1 && return
+
+    nft delete rule ip nat prerouting handle ${HANDLES[$IDX]}
+
+    save_rules
+    echo "✅ 已删除"
+    sleep 1
+}
+
 flush_all() {
     nft flush ruleset
     save_rules
     echo "✅ 已清空所有规则"
+    sleep 1
 }
 
-# ================= 卸载 =================
 uninstall_all() {
     echo "⚠️ 即将彻底卸载 nftables（不可恢复）"
-    read -p "确认？(y/N): " CONFIRM
+    read -p "确认输入 YES: " CONFIRM
 
-    [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]] && return
+    [[ "$CONFIRM" != "YES" ]] && return
 
+    nft flush ruleset 2>/dev/null
     systemctl stop nftables 2>/dev/null
     systemctl disable nftables 2>/dev/null
 
-    nft flush ruleset 2>/dev/null
-
     apt purge -y nftables
-    apt autoremove -y
+    rm -rf /etc/nftables.conf
 
-    rm -f /etc/nftables.conf
-
-    echo "✅ 已彻底卸载干净"
+    echo "✅ 已彻底卸载"
+    sleep 2
 }
 
-# ================= 主菜单 =================
-while true; do
-    clear
-    echo "==== NFT 转发管理 ===="
-    echo "1. 添加规则"
-    echo "2. 查看/删除"
-    echo "3. 清空"
-    echo "4. 退出"
-    echo "5. 彻底卸载 nftables"
-    echo "----------------------"
-    echo -n "当前规则数: "
-    nft list chain ip nat prerouting 2>/dev/null | grep -c dnat || echo 0
-    echo "----------------------"
+menu() {
+    while true; do
+        clear
+        echo "==== NFT 转发管理 ===="
+        echo "1. 添加规则"
+        echo "2. 查看规则"
+        echo "3. 删除规则"
+        echo "4. 清空规则"
+        echo "5. 彻底卸载"
+        echo "6. 退出"
+        echo "----------------------"
+        read -p "选择: " CH
 
-    read -p "选择: " OPT
+        case $CH in
+            1) init_env; add_rule ;;
+            2) list_rules; read -p "回车继续" ;;
+            3) delete_rule ;;
+            4) flush_all ;;
+            5) uninstall_all ;;
+            6) exit ;;
+            *) echo "无效输入"; sleep 1 ;;
+        esac
+    done
+}
 
-    case $OPT in
-        1) init_env; add_rule ;;
-        2) list_del ;;
-        3) flush_all ;;
-        4) exit 0 ;;
-        5) uninstall_all ;;
-        *) echo "无效输入"; sleep 1 ;;
-    esac
-done
+menu
