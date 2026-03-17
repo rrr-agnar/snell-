@@ -9,10 +9,12 @@ init_env() {
     if ! command -v nft >/dev/null 2>&1; then
         echo "未检测到 nftables，正在安装..."
         apt update -y && apt install -y nftables
-    else
-        echo "已检测到 nftables"
-        read -p "是否清空旧规则？(y/n): " CH
-        [[ $CH == "y" ]] && nft flush ruleset
+    fi
+
+    # 只有 reset 才清空
+    if [[ "$1" == "reset" ]]; then
+        echo "[RESET] 清空 nftables 规则..."
+        nft flush ruleset
     fi
 
     echo 1 > /proc/sys/net/ipv4/ip_forward
@@ -111,12 +113,7 @@ list_rules() {
 
 # ================= 删除规则 =================
 delete_rule() {
-    mapfile -t RULES < <(nft -a list chain ip nat prerouting | grep dnat)
-
-    [[ ${#RULES[@]} -eq 0 ]] && echo "无规则" && return
-
     list_rules
-
     read -p "输入端口: " PORT
 
     echo "删除方式:"
@@ -145,14 +142,24 @@ delete_rule() {
 
     save_rules
     echo "✅ 已处理"
+    sleep 1
+}
+
+# ================= 清空 =================
+flush_rules() {
+    nft flush ruleset
+    save_rules
+    echo "✅ 已清空"
+    sleep 1
 }
 
 # ================= 主菜单 =================
 menu() {
-    init_env
+    init_env "$1"
+
     while true; do
         clear
-        echo "==== NFT 转发管理（重构版）===="
+        echo "==== NFT 转发管理（终极版）===="
         echo "1. 添加规则"
         echo "2. 查看规则"
         echo "3. 删除规则"
@@ -164,11 +171,11 @@ menu() {
         case $CH in
             1) add_rule ;;
             2) list_rules; read -p "回车继续" ;;
-            3) delete_rule; read -p "回车继续" ;;
-            4) nft flush ruleset; save_rules ;;
+            3) delete_rule ;;
+            4) flush_rules ;;
             5) exit ;;
         esac
     done
 }
 
-menu
+menu "$1"
