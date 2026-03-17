@@ -1,16 +1,5 @@
 #!/bin/bash
 
-# ==========================================
-# NFTABLES 转发管理工具（最终完整版）
-# 支持：
-# ✔ 单端口 / 端口范围
-# ✔ 可选来源IP（留空=不限制）
-# ✔ 多用户隔离
-# ✔ 精确删除规则
-# ✔ 一键清空
-# ✔ 一键卸载
-# ==========================================
-
 stty erase ^? 2>/dev/null
 stty erase ^H 2>/dev/null
 
@@ -107,9 +96,70 @@ flush_all() {
     sleep 1
 }
 
+# 🔥 新增：添加来源IP限制
+add_src_ip() {
+    mapfile -t RULES < <(nft -a list chain ip nat prerouting | grep dnat)
+
+    [[ ${#RULES[@]} -eq 0 ]] && echo "无规则" && sleep 1 && return
+
+    echo "--- 选择规则添加来源IP ---"
+    printf "%s\n" "${RULES[@]}" | nl -w2 -s'. '
+
+    read -p "选择编号: " NUM
+    [[ -z "$NUM" ]] && return
+
+    IDX=$((NUM-1))
+    RULE="${RULES[$IDX]}"
+
+    HANDLE=$(echo "$RULE" | awk '{print $NF}')
+    PORT=$(echo "$RULE" | grep -oP 'dport \K[0-9-]+')
+    TARGET=$(echo "$RULE" | grep -oP 'to \K[^ ]+')
+
+    read -p "输入来源IP: " SRC
+    [[ -z "$SRC" ]] && echo "未输入" && return
+
+    nft delete rule ip nat prerouting handle $HANDLE
+
+    nft add rule ip nat prerouting ip saddr $SRC tcp dport $PORT counter dnat to $TARGET
+    nft add rule ip nat prerouting ip saddr $SRC udp dport $PORT counter dnat to $TARGET
+
+    save_rules
+    echo "✅ 已添加来源IP限制"
+    sleep 1
+}
+
+# 🔥 新增：取消来源IP限制
+remove_src_ip() {
+    mapfile -t RULES < <(nft -a list chain ip nat prerouting | grep dnat)
+
+    [[ ${#RULES[@]} -eq 0 ]] && echo "无规则" && sleep 1 && return
+
+    echo "--- 选择规则取消来源IP ---"
+    printf "%s\n" "${RULES[@]}" | nl -w2 -s'. '
+
+    read -p "选择编号: " NUM
+    [[ -z "$NUM" ]] && return
+
+    IDX=$((NUM-1))
+    RULE="${RULES[$IDX]}"
+
+    HANDLE=$(echo "$RULE" | awk '{print $NF}')
+    PORT=$(echo "$RULE" | grep -oP 'dport \K[0-9-]+')
+    TARGET=$(echo "$RULE" | grep -oP 'to \K[^ ]+')
+
+    nft delete rule ip nat prerouting handle $HANDLE
+
+    nft add rule ip nat prerouting tcp dport $PORT counter dnat to $TARGET
+    nft add rule ip nat prerouting udp dport $PORT counter dnat to $TARGET
+
+    save_rules
+    echo "✅ 已取消来源IP限制"
+    sleep 1
+}
+
 uninstall_all() {
-    echo "⚠️ 即将彻底卸载 nftables（不可恢复）"
-    read -p "确认输入 YES: " CONFIRM
+    echo "⚠️ 即将彻底卸载 nftables"
+    read -p "输入 YES 确认: " CONFIRM
 
     [[ "$CONFIRM" != "YES" ]] && return
 
@@ -133,7 +183,9 @@ menu() {
         echo "3. 删除规则"
         echo "4. 清空规则"
         echo "5. 彻底卸载"
-        echo "6. 退出"
+        echo "6. 添加来源IP限制"
+        echo "7. 取消来源IP限制"
+        echo "8. 退出"
         echo "----------------------"
         read -p "选择: " CH
 
@@ -143,7 +195,9 @@ menu() {
             3) delete_rule ;;
             4) flush_all ;;
             5) uninstall_all ;;
-            6) exit ;;
+            6) add_src_ip ;;
+            7) remove_src_ip ;;
+            8) exit ;;
             *) echo "无效输入"; sleep 1 ;;
         esac
     done
