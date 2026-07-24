@@ -1,6 +1,6 @@
 #!/bin/bash
 # ======================================
-#   Realm 转发管理器 v2.0
+#   Realm 一键安装 & 转发管理器 v3.0
 # ======================================
 
 REALM_BIN="/usr/local/bin/realm"
@@ -15,7 +15,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 PLAIN='\033[0m'
 
-# 初始化环境
+# 初始化环境与检测安装
 init() {
     mkdir -p "$CONFIG_DIR" "$BACKUP_DIR"
     if [ ! -f "$CONFIG" ]; then
@@ -24,6 +24,95 @@ init() {
 use_udp = true
 
 EOF
+    fi
+}
+
+# 检测 Realm 主程序与服务状态
+check_installation() {
+    if [ ! -f "$REALM_BIN" ]; then
+        echo -e "${RED}警告：检测到未安装 Realm 主程序！${PLAIN}"
+        read -rp "是否立即自动下载并安装 Realm？(y/n) [y]: " choice
+        choice=${choice:-y}
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            install_realm
+        else
+            echo -e "${YELLOW}请先安装 Realm 后再使用管理功能。${PLAIN}"
+            exit 1
+        fi
+    fi
+}
+
+# 一键安装 Realm 主程序与服务
+install_realm() {
+    echo -e "\n${YELLOW}--- 开始安装 Realm ---${PLAIN}"
+    
+    # 架构检测
+    local arch=$(uname -m)
+    local target_arch=""
+    case "$arch" in
+        x86_64|amd64) target_arch="x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) target_arch="aarch64-unknown-linux-gnu" ;;
+        *) echo -e "${RED}错误：暂不支持的系统架构 $arch${PLAIN}"; return 1 ;;
+    esac
+
+    # 依赖检查
+    if ! command -v curl &> /dev/null || ! command -v tar &> /dev/null; then
+        echo -e "${YELLOW}正在安装必要依赖 (curl, tar)...${PLAIN}"
+        apt-get update && apt-get install -y curl tar || yum install -y curl tar
+    fi
+
+    # 获取最新发布版本并下载
+    echo -e "${YELLOW}正在下载最新的 Realm 程序...${PLAIN}"
+    local download_url="https://github.com/zhboner/realm/releases/latest/download/realm-${target_arch}.tar.gz"
+    
+    curl -L -o /tmp/realm.tar.gz "$download_url"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}下载失败，请检查网络（特别是 GitHub 连接）${PLAIN}"
+        return 1
+    fi
+
+    tar -xvf /tmp/realm.tar.gz -C /tmp/
+    mv /tmp/realm "$REALM_BIN"
+    chmod +x "$REALM_BIN"
+    rm -f /tmp/realm.tar.gz
+
+    # 配置 systemd 服务
+    cat > "$SERVICE" << EOF
+[Unit]
+Description=Realm Relay Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=$REALM_BIN -c $CONFIG
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable realm >/dev/null 2>&1
+    
+    init
+    echo -e "${GREEN}Realm 安装并配置成功！${PLAIN}"
+}
+
+# 卸载 Realm
+uninstall_realm() {
+    echo -e "\n${RED}--- 正在卸载 Realm ---${PLAIN}"
+    read -rp "确定要彻底卸载 Realm 及其所有配置吗？(y/n): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        systemctl stop realm >/dev/null 2>&1
+        systemctl disable realm >/dev/null 2>&1
+        rm -f "$SERVICE"
+        rm -f "$REALM_BIN"
+        rm -rf "$CONFIG_DIR"
+        systemctl daemon-reload
+        echo -e "${GREEN}卸载完成！${PLAIN}"
+        exit 0
     fi
 }
 
@@ -73,7 +162,6 @@ delete_rule() {
         return
     fi
 
-    # 通过 awk 精确定位并删除指定的 [[endpoints]] 块
     awk -v port="0.0.0.0:$port" '
     BEGIN { skip = 0 }
     /\[\[endpoints\]\]/ {
@@ -111,7 +199,6 @@ edit_rule() {
     read -rp "新目标地址与端口 (如 1.2.3.4:8080): " new_remote
     read -rp "新备注 (可选): " new_note
 
-    # 先删除旧规则，再添加新规则
     awk -v port="0.0.0.0:$port" '
     BEGIN { skip = 0 }
     /\[\[endpoints\]\]/ {
@@ -160,40 +247,18 @@ list_rules() {
     echo -e "${YELLOW}==============================================${PLAIN}"
 }
 
-# 5. 重启 Realm
-restart_realm() {
-    systemctl restart realm
-    echo -e "${GREEN}Realm 服务已重启${PLAIN}"
-}
-
-# 6. 启动 Realm
-start_realm() {
-    systemctl start realm
-    echo -e "${GREEN}Realm 服务已启动${PLAIN}"
-}
-
-# 7. 停止 Realm
-stop_realm() {
-    systemctl stop realm
-    echo -e "${GREEN}Realm 服务已停止${PLAIN}"
-}
-
-# 8. 查看状态
-status_realm() {
-    systemctl status realm --no-pager
-}
-
-# 9. 查看日志
-logs_realm() {
-    echo -e "${YELLOW}按 Ctrl+C 退出日志查看${PLAIN}"
-    journalctl -u realm -f -n 50
-}
+# 5-9. 服务管理
+restart_realm() { systemctl restart realm && echo -e "${GREEN}Realm 服务已重启${PLAIN}"; }
+start_realm()   { systemctl start realm && echo -e "${GREEN}Realm 服务已启动${PLAIN}"; }
+stop_realm()    { systemctl stop realm && echo -e "${GREEN}Realm 服务已停止${PLAIN}"; }
+status_realm()  { systemctl status realm --no-pager; }
+logs_realm()    { echo -e "${YELLOW}按 Ctrl+C 退出日志查看${PLAIN}"; journalctl -u realm -f -n 50; }
 
 # 10. 备份配置
 backup_config() {
     local filename="config_backup_$(date +%Y%m%d_%H%M%S).toml"
     cp "$CONFIG" "$BACKUP_DIR/$filename"
-    echo -e "${GREEN}备份成功！备份文件保存在: $BACKUP_DIR/$filename${PLAIN}"
+    echo -e "${GREEN}备份成功！文件保存至: $BACKUP_DIR/$filename${PLAIN}"
 }
 
 # 11. 恢复配置
@@ -229,19 +294,21 @@ auto_restart() {
 # 主菜单
 main_menu() {
     init
+    check_installation
     while true; do
         echo -e "
 ${GREEN}======================================${PLAIN}
-${GREEN}      Realm 转发管理器 v2.0${PLAIN}
+${GREEN}      Realm 转发管理器 v3.0${PLAIN}
 ${GREEN}======================================${PLAIN}
  ${GREEN}1.${PLAIN} 添加转发       ${GREEN}7.${PLAIN} 停止 Realm
  ${GREEN}2.${PLAIN} 删除转发       ${GREEN}8.${PLAIN} 查看状态
  ${GREEN}3.${PLAIN} 修改转发       ${GREEN}9.${PLAIN} 查看日志
  ${GREEN}4.${PLAIN} 查看规则       ${GREEN}10.${PLAIN} 备份配置
  ${GREEN}5.${PLAIN} 重启 Realm     ${GREEN}11.${PLAIN} 恢复配置
- ${GREEN}6.${PLAIN} 启动 Realm      ${GREEN}0.${PLAIN} 退出
+ ${GREEN}6.${PLAIN} 启动 Realm      ${GREEN}12.${PLAIN} ${RED}卸载 Realm${PLAIN}
+ ${GREEN}0.${PLAIN} 退出
 "
-        read -rp "请输入数字 [0-11]: " option
+        read -rp "请输入数字 [0-12]: " option
         case "$option" in
             1) add_rule ;;
             2) delete_rule ;;
@@ -254,11 +321,12 @@ ${GREEN}======================================${PLAIN}
             9) logs_realm ;;
             10) backup_config ;;
             11) restore_config ;;
+            12) uninstall_realm ;;
             0) exit 0 ;;
             *) echo -e "${RED}请输入正确的数字！${PLAIN}" ;;
         esac
     done
 }
 
-# 运行脚本
+# 运行主逻辑
 main_menu
